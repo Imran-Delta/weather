@@ -1,0 +1,5 @@
+## Extending
+
+- Add new Köppen profiles by editing `KOPPEN_PROFILES`.
+- Add new weather conditions: insert into `_FLAVORS`, `_ASCII_ART`, and the condition ladder in `_generate_weather`.
+- Modify disaster thresholds in the profiles.
