@@ -8,6 +8,6 @@ __version__ = "0.0.1dev1"
 __author__ = "Imran Bin Gifary (System Delta)"
 __license__ = "BSD-3-Clause"
 
-from .weather import weather, WeatherData, list_koppen_codes
+from .weather import weather, WeatherData, list_koppen_codes, WeatherArchive
 
 __all__ = ["weather", "WeatherData", "list_koppen_codes"]

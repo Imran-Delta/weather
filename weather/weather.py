@@ -1,5 +1,5 @@
 """
-weather - Deterministic weather generation for games and simulations.
+weather - Deterministic weather generation with checkpoint archive.
 
 A single function `weather()` produces a complete weather report for any moment in time,
 with optional location and climate parameters. All randomness is seeded by the time input,
@@ -26,6 +26,8 @@ Example:
 
 import math
 import random
+import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple, Union
 from dataclasses import dataclass
@@ -38,6 +40,11 @@ HOURS_PER_DAY = 24
 MINUTES_PER_DAY = MINUTES_PER_HOUR * HOURS_PER_DAY
 DAYS_PER_YEAR = 365
 MINUTES_PER_YEAR = MINUTES_PER_DAY * DAYS_PER_YEAR
+
+# ----------------------------------------------------------------------
+# Per‑trend memory for smoothing (NEW)
+# ----------------------------------------------------------------------
+_weather_memories: Dict[Any, Dict[int, str]] = {}   # key: trend_id, value: dict {minute: condition}
 
 # ----------------------------------------------------------------------
 # Deterministic random (seeded)
@@ -523,22 +530,29 @@ _ASCII_ART = {
 }
 
 # ----------------------------------------------------------------------
-# Weather smoothing (small memory)
+# Weather smoothing with per‑trend memory (MODIFIED)
 # ----------------------------------------------------------------------
+
 _weather_memory: Dict[int, str] = {}
 
-def _smooth_condition(raw_condition: str, game_minutes: int) -> str:
-    global _weather_memory
-    prev = _weather_memory.get(game_minutes - 1)
+def _smooth_condition(raw_condition: str, game_minutes: int, trend_id: Any = None) -> str:
+    """
+    Apply smoothing using the memory for the given trend_id.
+    If trend_id is None, uses a global default memory (key = 0).
+    """
+    # Get the per‑trend memory dict
+    memories = _weather_memories.setdefault(trend_id if trend_id is not None else 0, {})
+    prev = memories.get(game_minutes - 1)
 
     if not prev:
-        _weather_memory[game_minutes] = raw_condition
-        if len(_weather_memory) > 5:
-            oldest = min(_weather_memory.keys())
-            del _weather_memory[oldest]
+        memories[game_minutes] = raw_condition
+        # Keep only last 5 entries (original behaviour)
+        if len(memories) > 5:
+            oldest = min(memories.keys())
+            del memories[oldest]
         return raw_condition
 
-    # Simple transition rules
+    # Original smoothing logic (unchanged)
     if "heavy" in raw_condition and "light" not in prev and "clear" in prev:
         raw_condition = raw_condition.replace("heavy", "light")
     if "rain" in raw_condition and "rain" not in prev and "heavy" not in prev:
@@ -549,10 +563,10 @@ def _smooth_condition(raw_condition: str, game_minutes: int) -> str:
     if "light rain" in prev and raw_condition == "clear":
         raw_condition = "partly cloudy"
 
-    _weather_memory[game_minutes] = raw_condition
-    if len(_weather_memory) > 5:
-        oldest = min(_weather_memory.keys())
-        del _weather_memory[oldest]
+    memories[game_minutes] = raw_condition
+    if len(memories) > 5:
+        oldest = min(memories.keys())
+        del memories[oldest]
     return raw_condition
 
 # ----------------------------------------------------------------------
@@ -564,7 +578,8 @@ def _generate_weather(
     latitude: float,
     longitude: float,
     elevation: float,
-    allow_all_disasters: bool
+    allow_all_disasters: bool,
+    trend_id: Any = None,          # NEW
 ) -> "WeatherData":
     """Core deterministic weather generator."""
     # Time components
@@ -741,7 +756,7 @@ def _generate_weather(
         condition = "downburst"
 
     # --- Apply smoothing ---
-    condition = _smooth_condition(condition, game_minutes)
+    condition = _smooth_condition(condition, game_minutes, trend_id)
 
     cloud_cover = int(precip_prob * 100)
 
@@ -816,10 +831,11 @@ def weather(
     elevation: float = 0.0,
     koppen: Optional[str] = None,
     allow_all_disasters: bool = False,
+    trend_id: Any = None,           # NEW
 ) -> WeatherData:
     """
-    Generate deterministic weather for a given time and location.
-
+    Generate deterministic weather. If trend_id is provided, the internal
+    smoothing memory is isolated per trend, allowing concurrent use
     Args:
         game_minutes: Direct game minute count. If None, real_time is used.
         real_time: A datetime object (assumed UTC). If None and game_minutes is None,
@@ -857,7 +873,316 @@ def weather(
     if allow_all_disasters:
         params["disasters_allowed"] = ALL_DISASTERS
 
-    return _generate_weather(gm, params, latitude, longitude, elevation, allow_all_disasters)
+    return _generate_weather(gm, params, latitude, longitude, elevation, allow_all_disasters, trend_id)
+
+
+# ----------------------------------------------------------------------
+# WeatherArchive – checkpoint storage with smoothing continuity
+# ----------------------------------------------------------------------
+class WeatherArchive:
+    """
+    Persistent archive of weather checkpoints using SQLite.
+    Ensures smooth weather transitions even when jumping to arbitrary
+    game minutes by generating forward from the nearest stored checkpoint.
+    Thread‑safe: concurrent requests for different trends are allowed;
+    requests for the same trend are serialized.
+    """
+
+    def __init__(self, db_path: str = "weather.db", checkpoint_interval: int = 1440):
+        self.db_path = db_path
+        self.checkpoint_interval = checkpoint_interval
+        self._init_db()
+        self._trend_locks: Dict[int, threading.Lock] = {}
+        self._global_lock = threading.Lock()
+
+    def _init_db(self):
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    elevation REAL NOT NULL,
+                    koppen TEXT,
+                    allow_all_disasters INTEGER DEFAULT 0,
+                    last_checkpoint INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trend_id INTEGER NOT NULL REFERENCES trends(id) ON DELETE CASCADE,
+                    game_minutes INTEGER NOT NULL,
+                    condition TEXT NOT NULL,
+                    temperature REAL NOT NULL,
+                    feels_like REAL NOT NULL,
+                    pressure REAL NOT NULL,
+                    humidity REAL NOT NULL,
+                    dew_point REAL NOT NULL,
+                    wind_speed REAL NOT NULL,
+                    wind_direction REAL NOT NULL,
+                    wind_cardinal TEXT NOT NULL,
+                    cloud_cover INTEGER NOT NULL,
+                    precipitation_prob REAL NOT NULL,
+                    instability REAL NOT NULL,
+                    moon_phase TEXT NOT NULL,
+                    moon_emoji TEXT NOT NULL,
+                    season_event TEXT,
+                    flavor TEXT NOT NULL,
+                    ascii_art TEXT NOT NULL,
+                    datetime_str TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(trend_id, game_minutes)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_checkpoints_trend_minute ON checkpoints(trend_id, game_minutes)")
+            conn.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _get_trend_lock(self, trend_id: int) -> threading.Lock:
+        with self._global_lock:
+            if trend_id not in self._trend_locks:
+                self._trend_locks[trend_id] = threading.Lock()
+            return self._trend_locks[trend_id]
+
+    # ------------------------------------------------------------------
+    # Trend management
+    # ------------------------------------------------------------------
+    def add_trend(self, name: str, latitude: float, longitude: float,
+                  elevation: float, koppen: Optional[str] = None,
+                  allow_all_disasters: bool = False) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("""
+                INSERT INTO trends
+                    (name, latitude, longitude, elevation, koppen, allow_all_disasters)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (name, latitude, longitude, elevation,
+                  koppen, 1 if allow_all_disasters else 0))
+            trend_id = cur.lastrowid
+            conn.commit()
+        return trend_id
+
+    def list_trends(self) -> List[dict]:
+        with self._connect() as conn:
+            cur = conn.execute("SELECT * FROM trends ORDER BY id")
+            return [dict(row) for row in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Weather retrieval (thread‑safe)
+    # ------------------------------------------------------------------
+    def get_weather(self, trend_id: int, target_minute: int,
+                    read_only: bool = False,
+                    force_generate: bool = False,
+                    exact: bool = False,
+                    fast_forward_step: Optional[int] = None) -> WeatherData:
+        """
+        Return the weather for target_minute in the given trend.
+
+        Args:
+            read_only: If True, no new checkpoints are stored.
+            force_generate: If True, ignore existing checkpoints and regenerate from minute 0.
+            exact: If True, always generate minute-by-minute (full accuracy, slower).
+                   If False (default), use fast-forward leaps when the gap is large.
+            fast_forward_step: Override the leap size (in minutes). Defaults to
+                               self.checkpoint_interval (1440 = one game-day).
+        """
+        lock = self._get_trend_lock(trend_id)
+        with lock:
+            return self._get_weather_locked(trend_id, target_minute, read_only,
+                                            force_generate, exact, fast_forward_step)
+
+    def _get_weather_locked(self, trend_id: int, target_minute: int,
+                            read_only: bool, force_generate: bool,
+                            exact: bool, fast_forward_step: Optional[int]) -> WeatherData:
+        with self._connect() as conn:
+            # Fetch trend parameters
+            row = conn.execute("""
+                SELECT latitude, longitude, elevation, koppen, allow_all_disasters,
+                       last_checkpoint
+                FROM trends WHERE id = ?
+            """, (trend_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"Trend {trend_id} not found")
+
+            params = {
+                'latitude': row['latitude'],
+                'longitude': row['longitude'],
+                'elevation': row['elevation'],
+                'koppen': row['koppen'],
+                'allow_all_disasters': bool(row['allow_all_disasters'])
+            }
+            last_checkpoint = row['last_checkpoint']
+
+            # Find starting minute (nearest checkpoint <= target)
+            if force_generate or last_checkpoint is None:
+                start_minute = -1
+            else:
+                cp_row = conn.execute("""
+                    SELECT game_minutes FROM checkpoints
+                    WHERE trend_id = ? AND game_minutes <= ?
+                    ORDER BY game_minutes DESC LIMIT 1
+                """, (trend_id, target_minute)).fetchone()
+                start_minute = cp_row['game_minutes'] if cp_row else -1
+
+            # Exact checkpoint hit — return immediately
+            if start_minute == target_minute:
+                return self._fetch_checkpoint(conn, trend_id, target_minute)
+
+            # Prime smoothing memory with the start minute
+            if start_minute >= 0:
+                last_w = weather(
+                    game_minutes=start_minute,
+                    latitude=params['latitude'],
+                    longitude=params['longitude'],
+                    elevation=params['elevation'],
+                    koppen=params['koppen'],
+                    allow_all_disasters=params['allow_all_disasters'],
+                    trend_id=trend_id
+                )
+            else:
+                # No checkpoint — bootstrap from minute 0
+                start_minute = 0
+                last_w = weather(
+                    game_minutes=0,
+                    latitude=params['latitude'],
+                    longitude=params['longitude'],
+                    elevation=params['elevation'],
+                    koppen=params['koppen'],
+                    allow_all_disasters=params['allow_all_disasters'],
+                    trend_id=trend_id
+                )
+
+            gap = target_minute - start_minute
+            step = fast_forward_step if fast_forward_step is not None else self.checkpoint_interval
+
+            # ------------------------------------------------------------------
+            # Fast-forward mode: leap in chunks, back-filling smoothing memory
+            # ------------------------------------------------------------------
+            if not exact and gap >= step:
+                current_minute = start_minute
+                current_w = last_w
+
+                while current_minute < target_minute:
+                    next_boundary = min(current_minute + step, target_minute)
+
+                    if next_boundary > current_minute + 1:
+                        # Back-fill smoothing memory for skipped interior minutes
+                        mem = _weather_memories.setdefault(trend_id, {})
+                        for m in range(current_minute + 1, next_boundary):
+                            mem[m] = current_w.condition
+
+                    # Generate only the boundary minute
+                    w = weather(
+                        game_minutes=next_boundary,
+                        latitude=params['latitude'],
+                        longitude=params['longitude'],
+                        elevation=params['elevation'],
+                        koppen=params['koppen'],
+                        allow_all_disasters=params['allow_all_disasters'],
+                        trend_id=trend_id
+                    )
+
+                    if not read_only and (next_boundary % self.checkpoint_interval == 0
+                                          or next_boundary == target_minute):
+                        self._insert_checkpoint(conn, trend_id, w)
+
+                    current_minute = next_boundary
+                    current_w = w
+
+                last_saved = current_minute
+                if not read_only and last_saved > (last_checkpoint if last_checkpoint else -1):
+                    conn.execute("UPDATE trends SET last_checkpoint = ? WHERE id = ?",
+                                 (last_saved, trend_id))
+                conn.commit()
+                return w  # w is the weather at target_minute
+
+            # ------------------------------------------------------------------
+            # Exact mode: classic minute-by-minute (full accuracy)
+            # ------------------------------------------------------------------
+            else:
+                last_saved = start_minute
+                for gm in range(start_minute + 1, target_minute + 1):
+                    w = weather(
+                        game_minutes=gm,
+                        latitude=params['latitude'],
+                        longitude=params['longitude'],
+                        elevation=params['elevation'],
+                        koppen=params['koppen'],
+                        allow_all_disasters=params['allow_all_disasters'],
+                        trend_id=trend_id
+                    )
+                    if not read_only and (gm % self.checkpoint_interval == 0
+                                          or gm == target_minute):
+                        self._insert_checkpoint(conn, trend_id, w)
+                        last_saved = gm
+
+                if not read_only and last_saved > (last_checkpoint if last_checkpoint else -1):
+                    conn.execute("UPDATE trends SET last_checkpoint = ? WHERE id = ?",
+                                 (last_saved, trend_id))
+                conn.commit()
+                return w
+
+    def _fetch_checkpoint(self, conn: sqlite3.Connection,
+                          trend_id: int, minute: int) -> WeatherData:
+        row = conn.execute("""
+            SELECT game_minutes, condition, temperature, feels_like,
+                   pressure, humidity, dew_point, wind_speed,
+                   wind_direction, wind_cardinal, cloud_cover,
+                   precipitation_prob, instability, moon_phase,
+                   moon_emoji, season_event, flavor, ascii_art,
+                   datetime_str
+            FROM checkpoints
+            WHERE trend_id = ? AND game_minutes = ?
+        """, (trend_id, minute)).fetchone()
+        if row is None:
+            raise ValueError(f"No checkpoint for trend {trend_id} at minute {minute}")
+        return WeatherData(
+            game_minutes=row['game_minutes'],
+            datetime_str=row['datetime_str'],
+            temperature=row['temperature'],
+            feels_like=row['feels_like'],
+            pressure=row['pressure'],
+            humidity=row['humidity'],
+            dew_point=row['dew_point'],
+            wind_speed=row['wind_speed'],
+            wind_direction=row['wind_direction'],
+            wind_cardinal=row['wind_cardinal'],
+            condition=row['condition'],
+            cloud_cover=row['cloud_cover'],
+            precipitation_prob=row['precipitation_prob'],
+            instability=row['instability'],
+            moon_phase=row['moon_phase'],
+            moon_emoji=row['moon_emoji'],
+            season_event=row['season_event'],
+            flavor=row['flavor'],
+            ascii_art=row['ascii_art']
+        )
+
+    def _insert_checkpoint(self, conn: sqlite3.Connection,
+                           trend_id: int, w: WeatherData):
+        conn.execute("""
+            INSERT OR REPLACE INTO checkpoints (
+                trend_id, game_minutes, condition, temperature,
+                feels_like, pressure, humidity, dew_point,
+                wind_speed, wind_direction, wind_cardinal,
+                cloud_cover, precipitation_prob, instability,
+                moon_phase, moon_emoji, season_event, flavor,
+                ascii_art, datetime_str
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            trend_id, w.game_minutes, w.condition,
+            w.temperature, w.feels_like, w.pressure, w.humidity, w.dew_point,
+            w.wind_speed, w.wind_direction, w.wind_cardinal,
+            w.cloud_cover, w.precipitation_prob, w.instability,
+            w.moon_phase, w.moon_emoji, w.season_event, w.flavor,
+            w.ascii_art, w.datetime_str
+        ))
 
 # ----------------------------------------------------------------------
 # Optional: convenience function to list available Köppen codes
