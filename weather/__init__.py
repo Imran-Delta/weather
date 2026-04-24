@@ -4,7 +4,7 @@ Licensed under BSD 3-Clause
 Copyright (c) 2026 Imran Bin Gifary (System Delta)
 """
 
-__version__ = "0.0.1dev1"
+__version__ = "0.0.1dev2"
 __author__ = "Imran Bin Gifary (System Delta)"
 __license__ = "BSD-3-Clause"
 
